@@ -129,10 +129,15 @@ class Haar5ptDetector:
         min_size: Tuple[int, int] = (60, 60),
         smooth_alpha: float = 0.80,
         debug: bool = True,
+        max_faces: int = 8,
     ):
         self.debug = bool(debug)
         self.min_size = tuple(map(int, min_size))
-        self.smooth_alpha = float(smooth_alpha)
+        self.smooth_alpha = float(smooth_alpha)  # kept for backward compat; no longer
+        # used internally -- smoothing now happens one layer up, in
+        # LockedFaceTracker (face_tracking.py), which is the only place that
+        # knows which face is the *locked* one worth smoothing.
+        self.max_faces = int(max_faces)
 
         if haar_xml is None:
             haar_xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -154,7 +159,7 @@ class Haar5ptDetector:
         options = mp_vision.FaceLandmarkerOptions(
             base_options=base_options,
             running_mode=mp_vision.RunningMode.VIDEO,
-            num_faces=1,
+            num_faces=self.max_faces,
             min_face_detection_confidence=0.5,
             min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5,
@@ -168,8 +173,8 @@ class Haar5ptDetector:
         self.IDX_MOUTH_LEFT = 61
         self.IDX_MOUTH_RIGHT = 291
 
-        self._prev_box: Optional[np.ndarray] = None
-        self._prev_kps: Optional[np.ndarray] = None
+        # Per-face EMA smoothing was removed here (it only made sense for a
+        # single tracked face). LockedFaceTracker does the smoothing now.
 
     def _haar_faces(self, gray: np.ndarray) -> np.ndarray:
         faces = self.face_cascade.detectMultiScale(
@@ -183,7 +188,9 @@ class Haar5ptDetector:
             return np.zeros((0, 4), dtype=np.int32)
         return faces.astype(np.int32)
 
-    def _facemesh_5pt(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
+    def _facemesh_5pt_all(self, frame_bgr: np.ndarray) -> List[np.ndarray]:
+        """Return a list of (5,2) keypoint arrays, one per face FaceLandmarker
+        finds in the whole frame -- not just the largest Haar box."""
         H, W = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -192,9 +199,8 @@ class Haar5ptDetector:
         result = self.landmarker.detect_for_video(mp_image, self._ts_ms)
 
         if not result.face_landmarks:
-            return None
+            return []
 
-        lm = result.face_landmarks[0]
         idxs = [
             self.IDX_LEFT_EYE,
             self.IDX_RIGHT_EYE,
@@ -203,101 +209,118 @@ class Haar5ptDetector:
             self.IDX_MOUTH_RIGHT,
         ]
 
-        pts = []
-        for i in idxs:
-            p = lm[i]
-            pts.append([p.x * W, p.y * H])
-        kps = np.array(pts, dtype=np.float32)
+        all_kps = []
+        for lm in result.face_landmarks:
+            pts = [[lm[i].x * W, lm[i].y * H] for i in idxs]
+            kps = np.array(pts, dtype=np.float32)
+            if kps[0, 0] > kps[1, 0]:
+                kps[[0, 1]] = kps[[1, 0]]
+            if kps[3, 0] > kps[4, 0]:
+                kps[[3, 4]] = kps[[4, 3]]
+            all_kps.append(kps)
 
-        if kps[0, 0] > kps[1, 0]:
-            kps[[0, 1]] = kps[[1, 0]]
-        if kps[3, 0] > kps[4, 0]:
-            kps[[3, 4]] = kps[[4, 3]]
+        return all_kps
 
-        return kps
+    def detect(self, frame_bgr: np.ndarray, max_faces: Optional[int] = None) -> List[FaceKpsBox]:
+        """Return up to max_faces FaceKpsBox objects, largest-area first.
 
-    def detect(self, frame_bgr: np.ndarray, max_faces: int = 1) -> List[FaceKpsBox]:
+        Unlike the Part-1 version, this can return MORE THAN ONE face: Haar
+        proposes candidate boxes, FaceLandmarker (num_faces=self.max_faces)
+        proposes landmark sets for the whole frame, and each Haar box is
+        matched to whichever landmark set falls mostly inside it. This is
+        required by Part 2's identity lock (which must inspect several
+        candidates) and by the distractor-crossing test.
+        """
+        if max_faces is None:
+            max_faces = self.max_faces
+
         H, W = frame_bgr.shape[:2]
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        faces = self._haar_faces(gray)
+        haar_boxes = self._haar_faces(gray)
 
-        if faces.shape[0] == 0:
+        if haar_boxes.shape[0] == 0:
             return []
 
-        areas = faces[:, 2] * faces[:, 3]
-        i = int(np.argmax(areas))
-        x, y, w, h = faces[i].tolist()
-
-        kps = self._facemesh_5pt(frame_bgr)
-        if kps is None:
+        all_kps = self._facemesh_5pt_all(frame_bgr)
+        if not all_kps:
             if self.debug:
-                print("[haar_5pt] Haar face found but FaceLandmarker returned none -> reject")
+                print("[haar_5pt] Haar face(s) found but FaceLandmarker returned none -> reject")
             return []
 
-        margin = 0.35
-        x1m = x - margin * w
-        y1m = y - margin * h
-        x2m = x + (1.0 + margin) * w
-        y2m = y + (1.0 + margin) * h
+        results: List[FaceKpsBox] = []
+        used = set()
 
-        inside = (
-            (kps[:, 0] >= x1m) & (kps[:, 0] <= x2m) &
-            (kps[:, 1] >= y1m) & (kps[:, 1] <= y2m)
-        )
-        if inside.mean() < 0.60:
-            if self.debug:
-                print("[haar_5pt] FaceLandmarker points not consistent with Haar box -> reject")
-            return []
+        for (x, y, w, h) in haar_boxes.tolist():
+            margin = 0.35
+            x1m = x - margin * w
+            y1m = y - margin * h
+            x2m = x + (1.0 + margin) * w
+            y2m = y + (1.0 + margin) * h
 
-        if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18 * w)):
-            if self.debug:
-                print("[haar_5pt] 5pt geometry sanity failed -> reject")
-            return []
+            best_i, best_score = -1, 0.0
+            for i, kps in enumerate(all_kps):
+                if i in used:
+                    continue
+                inside = (
+                    (kps[:, 0] >= x1m) & (kps[:, 0] <= x2m) &
+                    (kps[:, 1] >= y1m) & (kps[:, 1] <= y2m)
+                )
+                score = float(inside.mean())
+                if score > best_score:
+                    best_score, best_i = score, i
 
-        box = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
-        box = _clip_box_xyxy(box, W, H)
+            if best_i == -1 or best_score < 0.60:
+                if self.debug:
+                    print("[haar_5pt] no FaceLandmarker set matched a Haar box -> skip")
+                continue
 
-        box_s = _ema(self._prev_box, box, self.smooth_alpha)
-        kps_s = _ema(self._prev_kps, kps, self.smooth_alpha)
+            kps = all_kps[best_i]
+            used.add(best_i)
 
-        self._prev_box = box_s.copy()
-        self._prev_kps = kps_s.copy()
+            if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18 * w)):
+                if self.debug:
+                    print("[haar_5pt] 5pt geometry sanity failed -> reject")
+                continue
 
-        x1, y1, x2, y2 = box_s.tolist()
-        score = 1.0
+            box = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
+            box = _clip_box_xyxy(box, W, H)
+            x1, y1, x2, y2 = box.tolist()
 
-        return [
-            FaceKpsBox(
-                x1=int(round(x1)),
-                y1=int(round(y1)),
-                x2=int(round(x2)),
-                y2=int(round(y2)),
-                score=float(score),
-                kps=kps_s.astype(np.float32),
+            results.append(
+                FaceKpsBox(
+                    x1=int(round(x1)),
+                    y1=int(round(y1)),
+                    x2=int(round(x2)),
+                    y2=int(round(y2)),
+                    score=best_score,
+                    kps=kps.astype(np.float32),
+                )
             )
-        ][:max_faces]
+
+        results.sort(key=lambda f: (f.x2 - f.x1) * (f.y2 - f.y1), reverse=True)
+        return results[:max_faces]
 
 
 def main():
     cap = cv2.VideoCapture(0)
-    det = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=True)
+    det = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=True, max_faces=8)
 
-    print("Haar + 5pt (FaceLandmarker) test. Press q to quit.")
+    print("Haar + 5pt (FaceLandmarker) test -- now multi-face. Press q to quit.")
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        faces = det.detect(frame, max_faces=1)
+        faces = det.detect(frame)  # up to max_faces now, largest first
         vis = frame.copy()
 
         if faces:
-            f = faces[0]
-            cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
-            for (x, y) in f.kps.astype(int):
-                cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
-            cv2.putText(vis, "OK", (f.x1, max(0, f.y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            for f in faces:
+                cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
+                for (x, y) in f.kps.astype(int):
+                    cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
+                cv2.putText(vis, "OK", (f.x1, max(0, f.y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         else:
             cv2.putText(vis, "no face", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
 

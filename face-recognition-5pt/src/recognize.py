@@ -1,5 +1,5 @@
 """
-Falcon Eye - Face Recognition + Servo Scanner (automatic, center-out, hold-and-check)
+Falcon Eye - Face Recognition + Servo Tracker (full-range sweep, direction-following)
 
 Pipeline:
 
@@ -9,26 +9,38 @@ Camera
    -> 5-point alignment
    -> ArcFace ONNX embedding
    -> Face database
-   -> Known / Stranger
+   -> Target / Known-not-target / Stranger
    -> MQTT
    -> ESP32
    -> servo
 
 Behavior:
 
-- Servo starts at 90 degrees (center).
-- Scanning starts automatically the moment the program is ready -- no
-  keypress needed.
-- The servo only moves to a new position if the known face was NOT found
-  after holding at the current position for POSITION_HOLD_TIME seconds.
-- At each position, the camera checks periodically for the full hold time.
-- If the known face is found at any point -> STOP, hold that position,
-  and keep watching there (does not resume scanning while you remain).
-- If a face is found but it does not match the database -> "Stranger"
-  (logged + published over MQTT), scanning continues at the same position
-  until the hold time runs out.
-- If all scan positions are exhausted with no match -> NOT_FOUND, then
-  the whole sweep restarts automatically from 90 degrees and keeps trying.
+- Servo starts at HOME_ANGLE (90 degrees).
+- Among the known identities in the database, you pick ONE "target" to
+  follow (TARGET_NAME below, or you'll be prompted at startup).
+- A full search is a continuous sweep across the WHOLE range, in two legs:
+      Leg 1: current angle -> 0 degrees
+      Leg 2: 0 degrees      -> 180 degrees
+  The servo moves in small continuous steps (not big jumps + long holds),
+  checking the camera at every step. Only if BOTH legs complete with no
+  sighting is the target's absence "confirmed" (logged + published over
+  MQTT), and the whole sweep restarts from HOME_ANGLE.
+- If the target is found at any point during a leg, the servo STOPS
+  sweeping and LOCKS on: it actively tracks/follows the target's
+  left-right movement in frame in real time.
+- When the target then disappears from view, Falcon Eye does NOT restart
+  the whole search. It simply resumes the continuous sweep in the exact
+  same direction it was already heading (toward that leg's end angle)
+  from wherever the servo currently is. If it reaches that leg's end
+  angle without finding them again, that direction is confirmed empty
+  and it moves on to the next leg. Only once every direction has been
+  covered without a sighting does it conclude "not there" (absence
+  confirmed).
+- A known face that is NOT the chosen target is reported as "known, not
+  target" and does not cause a lock -- the sweep continues.
+- Any unrecognized face is reported as "Stranger" (console + MQTT + a
+  vivid red on-screen banner).
 - Press 'q' at any time to quit.
 """
 
@@ -70,27 +82,90 @@ TOPIC_RECOGNITION = "falcon/eye/recognition"
 
 
 # ============================================================
-# SCANNER CONFIGURATION
+# WHO TO FOLLOW
 # ============================================================
 
-# Start centered, then sweep outward alternating right/left
-SCAN_ANGLES = [90, 110, 70, 130, 50, 150, 30, 170, 10, 180, 0]
+# Set this to a name that exists in your face database to skip the
+# startup prompt (e.g. TARGET_NAME = "Darius"). Leave as None to be
+# prompted with a list of known identities every run.
+TARGET_NAME: Optional[str] = None
 
-NUMBER_OF_SCANS = len(SCAN_ANGLES)
+
+# ============================================================
+# SERVO / SWEEP CONFIGURATION
+# ============================================================
 
 HOME_ANGLE = 90
 
-# Time for servo to move/stabilize before checking faces
+# Time to let the servo settle after a large jump (e.g. moving to the
+# start of a new leg).
 SERVO_SETTLE_TIME = 0.8
 
-# How long to stay at each position looking for the known face
-POSITION_HOLD_TIME = 5.0
-
-# How often to sample a frame while holding at a position
-FRAME_CHECK_INTERVAL = 0.5
+# Degrees per step while continuously sweeping, and the pause after each
+# small step to let the servo settle before the camera check. Smaller
+# step / longer pause = more thorough but slower; tune for your rig.
+SCAN_STEP_ANGLE = 5
+SCAN_STEP_SETTLE_TIME = 3
 
 # ArcFace acceptance threshold
-DISTANCE_THRESHOLD = 0.34
+DISTANCE_THRESHOLD = 0.5
+
+
+# ============================================================
+# TRACKING CONFIGURATION (following the target while locked on)
+# ============================================================
+
+# Flip to -1 if the servo turns the "wrong way" relative to how the
+# target appears to move in frame (calibrate once for your rig).
+# Confirmed -1 for this rig: with +1, correction nudges kept moving the
+# servo monotonically AWAY from a stationary target (offset never
+# shrank -- it hit TRACK_MAX_STEP every cycle until the target fell out
+# of frame), which is the signature of an inverted feedback loop.
+SERVO_DIRECTION_SIGN = -1
+
+# Degrees of servo movement per full-frame horizontal offset (offset
+# ranges from -1.0 at the left edge to +1.0 at the right edge).
+# Lowered from 25.0: that gain, combined with TRACK_MAX_STEP, was swinging
+# the servo past a stationary face on every correction, which is what was
+# causing the found -> lost -> found cycling.
+TRACK_GAIN = 10.0
+
+# Max degrees the servo is allowed to move in a single tracking nudge,
+# to keep motion smooth instead of jerky.
+TRACK_MAX_STEP = 3.0
+
+# Ignore small offsets near center so the servo doesn't hunt/jitter.
+TRACK_DEADZONE = 0.12
+
+# How often to sample a frame while locked on and tracking (when no
+# nudge was made this cycle -- i.e. you're already centered).
+FRAME_CHECK_INTERVAL = 0.5
+
+# Extra settle time to wait after a nudge before grabbing the next frame.
+# Without this, the camera can still be mid-turn (motion blur / you
+# temporarily out of frame) when the next frame is captured, which reads
+# as a "missed" detection even though you never left.
+TRACK_SETTLE_TIME = 0.5
+
+# How many consecutive missed checks before we consider the target
+# actually gone (rather than a momentary blink/occlusion/settle frame).
+MISSED_CHECKS_BEFORE_LOST = 8
+
+
+# ============================================================
+# CHASE CONFIGURATION (recovering a target that just left frame)
+# ============================================================
+
+# When the target disappears, before falling back to the normal sweep we
+# make a quick, more aggressive push further in the direction they were
+# last drifting -- i.e. the edge of frame they exited from -- since
+# that's the most likely direction they actually walked.
+CHASE_STEP_ANGLE = 8
+CHASE_STEP_SETTLE_TIME = 0.35
+
+# How far past the angle where we lost them we're willing to chase
+# before giving up and declaring them genuinely lost.
+CHASE_MAX_DEGREES = 45
 
 
 # ============================================================
@@ -238,6 +313,8 @@ class ServoController:
     def __init__(self):
         self.connected = False
         self.last_status = None
+        self.current_angle = HOME_ANGLE  # last angle WE commanded
+        self.actual_angle = HOME_ANGLE   # last angle the ESP32 confirmed reaching
 
         self.client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2
@@ -271,14 +348,28 @@ class ServoController:
             payload = message.payload.decode()
             self.last_status = payload
             print("[ESP]", payload)
+
+            # Keep our notion of the PHYSICAL angle in sync with what the
+            # ESP32 actually confirms, rather than trusting the optimistic
+            # angle we set in move_to() the instant we send a command.
+            try:
+                data = json.loads(payload)
+                if data.get("status") == "ANGLE_REACHED" and "angle" in data:
+                    self.actual_angle = int(data["angle"])
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
         except Exception as e:
             print("[MQTT] Message error:", e)
 
-    def move_to(self, angle: int):
-        angle = max(0, min(180, int(angle)))
+    def move_to(self, angle: float):
+        angle = max(0, min(180, int(round(angle))))
+        self.current_angle = angle
         command = f"ANGLE:{angle}"
-        print("[MQTT] -> ESP:", command)
         self.client.publish(TOPIC_SERVO_CMD, command)
+
+    def nudge(self, delta_degrees: float):
+        """Move relative to the current angle -- used for live tracking."""
+        self.move_to(self.current_angle + delta_degrees)
 
     def stop(self):
         print("[MQTT] -> ESP: STOP")
@@ -288,22 +379,18 @@ class ServoController:
         print("[MQTT] -> ESP: HOME")
         self.client.publish(TOPIC_SERVO_CMD, "HOME")
 
-    def publish_recognition(self, name, distance, similarity, angle, attempt):
+    def publish_recognition(self, name, distance, similarity, angle, status="TARGET"):
         payload = {
             "name": name,
+            "status": status,
             "distance": float(distance),
             "similarity": float(similarity),
             "angle": int(angle),
-            "attempt": int(attempt)
         }
         self.client.publish(TOPIC_RECOGNITION, json.dumps(payload))
 
     def publish_not_found(self):
-        payload = {
-            "name": None,
-            "status": "NOT_FOUND",
-            "attempts": NUMBER_OF_SCANS
-        }
+        payload = {"name": None, "status": "NOT_FOUND"}
         self.client.publish(TOPIC_RECOGNITION, json.dumps(payload))
 
     def close(self):
@@ -315,162 +402,428 @@ class ServoController:
 
 
 # ============================================================
-# FACE RECOGNITION
+# FACE ANALYSIS + CLASSIFICATION
 # ============================================================
 
-def recognize_frame(frame, detector, embedder, matcher):
+def analyze_frame(frame, detector, embedder, matcher) -> List[Tuple[object, MatchResult]]:
+    """Returns a list of (face, MatchResult) for every face detected in the frame."""
     faces = detector.detect(frame, max_faces=5)
-
-    if not faces:
-        return None, faces
-
-    best_result = None
+    results = []
 
     for face in faces:
         aligned, _ = align_face_5pt(frame, face.kps, out_size=(112, 112))
         embedding = embedder.embed(aligned)
         result = matcher.match(embedding)
+        results.append((face, result))
 
-        if best_result is None or result.distance < best_result.distance:
-            best_result = result
+    return results
 
-    return best_result, faces
+
+def classify(result: MatchResult, target_name: Optional[str]) -> str:
+    """TARGET / OTHER_KNOWN / STRANGER for a single match result."""
+    if result.accepted and target_name is not None and result.name == target_name:
+        return "TARGET"
+    if result.accepted:
+        return "OTHER_KNOWN"
+    return "STRANGER"
+
+
+def find_target(results, target_name: Optional[str]):
+    """Returns (face, result) for the target if present among results, else None."""
+    if target_name is None:
+        return None
+    for face, result in results:
+        if classify(result, target_name) == "TARGET":
+            return face, result
+    return None
+
+
+def face_offset_normalized(face, frame_w: int) -> float:
+    """Horizontal offset of a face's center from the frame's center, -1 (left) to +1 (right)."""
+    cx = (face.x1 + face.x2) / 2.0
+    offset = (cx - frame_w / 2.0) / (frame_w / 2.0)
+    return float(np.clip(offset, -1.0, 1.0))
 
 
 # ============================================================
-# DRAWING
+# DRAWING -- vivid status overlays
 # ============================================================
 
-def draw_faces(frame, faces):
+STATUS_COLORS = {
+    "TARGET": (0, 255, 0),
+    "OTHER_KNOWN": (0, 255, 255),
+    "STRANGER": (0, 0, 255),
+}
+
+
+def draw_results(frame, results, target_name: Optional[str]):
     vis = frame.copy()
 
-    for face in faces:
-        cv2.rectangle(vis, (face.x1, face.y1), (face.x2, face.y2), (0, 255, 0), 2)
+    for face, result in results:
+        status = classify(result, target_name)
+        color = STATUS_COLORS[status]
 
+        cv2.rectangle(vis, (face.x1, face.y1), (face.x2, face.y2), color, 2)
         for x, y in face.kps.astype(int):
-            cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
+            cv2.circle(vis, (int(x), int(y)), 2, color, -1)
+
+        if status == "TARGET":
+            label = f"TARGET: {result.name}"
+        elif status == "OTHER_KNOWN":
+            label = f"KNOWN: {result.name}"
+        else:
+            label = "STRANGER"
+
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        ty = max(face.y1, th + 10)
+        cv2.rectangle(vis, (face.x1, ty - th - 10), (face.x1 + tw + 8, ty), color, -1)
+        text_color = (0, 0, 0) if status != "STRANGER" else (255, 255, 255)
+        cv2.putText(vis, label, (face.x1 + 4, ty - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
 
     return vis
 
 
-# ============================================================
-# ONE FULL SWEEP (returns name if found, None if exhausted)
-# Also handles the display window + 'q' quit check throughout.
-# ============================================================
+def draw_banner(vis, text: str, color, pulse: bool = False):
+    h, w = vis.shape[:2]
+    bar_h = 46
 
-def run_one_sweep(cap, detector, embedder, matcher, servo) -> Tuple[Optional[str], bool]:
+    overlay = vis.copy()
+    alpha = 0.55 + 0.25 * abs(np.sin(time.time() * 3.0)) if pulse else 0.75
+    cv2.rectangle(overlay, (0, 0), (w, bar_h), color, -1)
+    cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0, vis)
+
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)
+    cv2.putText(vis, text, (max(10, (w - tw) // 2), bar_h - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
+    return vis
+
+
+def compute_banner(results, target_name: Optional[str], target_present: bool):
+    """Priority: locked target > stranger present > other known present > searching."""
+    if target_present:
+        return f"TARGET LOCKED: {target_name}", (0, 140, 0), False
+
+    statuses = [classify(r, target_name) for _, r in results]
+
+    if "STRANGER" in statuses:
+        return "STRANGER DETECTED", (0, 0, 200), True
+
+    if "OTHER_KNOWN" in statuses:
+        names = ", ".join(sorted({r.name for f, r in results if classify(r, target_name) == "OTHER_KNOWN"}))
+        return f"KNOWN (not target): {names}", (0, 150, 150), False
+
+    label = f"SEARCHING for {target_name}..." if target_name else "SEARCHING..."
+    return label, (0, 0, 180), True
+
+
+def render_frame(frame, results, target_name, target_present, extra_text=None):
+    vis = draw_results(frame, results, target_name)
+    text, color, pulse = compute_banner(results, target_name, target_present)
+    if extra_text:
+        text = extra_text
+    vis = draw_banner(vis, text, color, pulse=pulse)
+    return vis
+
+
+def process_announcements(results, target_name, servo, angle, state):
     """
-    Returns (found_name_or_None, quit_requested)
+    Console + MQTT logging for strangers / other known faces, only firing on
+    a NEW sighting (transition into view) so a continuous sweep doesn't spam
+    the same person every step while they stay in frame.
     """
+    statuses_now = [classify(r, target_name) for _, r in results]
 
-    print()
-    print("=" * 60)
-    print("STARTING FACE SCAN (start: 90 degrees)")
-    print("=" * 60)
-    print("Scan positions:", SCAN_ANGLES)
+    stranger_now = "STRANGER" in statuses_now
+    if stranger_now and not state["stranger_active"]:
+        r = next(r for f, r in results if classify(r, target_name) == "STRANGER")
+        print(f"[SWEEP] Stranger detected at {angle} degrees (dist={r.distance:.3f})")
+        servo.publish_recognition(name="Stranger", distance=r.distance,
+                                   similarity=r.similarity, angle=angle, status="STRANGER")
+    state["stranger_active"] = stranger_now
 
-    for attempt, angle in enumerate(SCAN_ANGLES, start=1):
+    known_now = {r.name for f, r in results if classify(r, target_name) == "OTHER_KNOWN"}
+    for name in known_now - state["known_active"]:
+        r = next(r for f, r in results if r.name == name and classify(r, target_name) == "OTHER_KNOWN")
+        print(f"[SWEEP] Known face (not target) at {angle} degrees: {name}")
+        servo.publish_recognition(name=name, distance=r.distance,
+                                   similarity=r.similarity, angle=angle, status="OTHER_KNOWN")
+    state["known_active"] = known_now
 
-        print()
-        print(f"[SCAN {attempt}/{NUMBER_OF_SCANS}] Moving to {angle} degrees")
 
-        servo.move_to(angle)
-        time.sleep(SERVO_SETTLE_TIME)
+# ============================================================
+# CONTINUOUS SWEEP -- one leg (e.g. 90 -> 0, or 0 -> 180)
+# ============================================================
 
-        position_start = time.time()
-        stranger_announced = False
+def continuous_sweep_phase(cap, detector, embedder, matcher, servo, target_name,
+                            start_angle, end_angle, announce_state) -> Tuple[str, bool]:
+    """
+    Continuously steps the servo from start_angle to end_angle, checking the
+    camera at every step. Returns (outcome, quit_requested) where outcome is
+    "found" (target spotted -- servo stopped at that angle) or
+    "not_found_reached_end" (reached end_angle with no sighting).
+    """
+    direction = 1 if end_angle >= start_angle else -1
+    angle = start_angle
 
-        while (time.time() - position_start) < POSITION_HOLD_TIME:
+    servo.move_to(angle)
+    time.sleep(SERVO_SETTLE_TIME)
 
-            ok, frame = cap.read()
+    while True:
+        ok, frame = cap.read()
 
-            if not ok:
-                print("[CAMERA] Failed to read frame")
-                time.sleep(FRAME_CHECK_INTERVAL)
-                continue
+        if ok:
+            results = analyze_frame(frame, detector, embedder, matcher)
+            target = find_target(results, target_name)
 
-            result, faces = recognize_frame(frame, detector, embedder, matcher)
-
-            # live preview window
-            vis = draw_faces(frame, faces)
-            header = f"scanning {angle} deg | IDs={len(matcher._names)} thr={matcher.dist_thresh:.2f}"
-            cv2.putText(vis, header, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+            vis = render_frame(frame, results, target_name, target_present=target is not None,
+                                extra_text=(f"SEARCHING for {target_name}...  ({servo.current_angle}\u00b0)"
+                                            if target_name else None))
             cv2.imshow("Falcon Eye", vis)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
-                return None, True
+                return "quit", True
 
-            # ----------------------------------------------
-            # NO FACE IN FRAME
-            # ----------------------------------------------
-            if result is None:
-                time.sleep(FRAME_CHECK_INTERVAL)
-                continue
-
-            # ----------------------------------------------
-            # KNOWN FACE -> STOP IMMEDIATELY
-            # ----------------------------------------------
-            if result.accepted:
-
+            if target is not None:
+                face, result = target
                 print()
                 print("=" * 60)
-                print("KNOWN FACE FOUND!")
+                print("TARGET FOUND!")
                 print("Name:", result.name)
                 print("Distance:", f"{result.distance:.3f}")
-                print("Similarity:", f"{result.similarity:.3f}")
-                print("Angle:", angle)
+                print("Angle:", servo.current_angle)
                 print("=" * 60)
+                servo.publish_recognition(name=result.name, distance=result.distance,
+                                           similarity=result.similarity,
+                                           angle=servo.current_angle, status="TARGET")
+                return "found", False
 
-                servo.stop()
+            process_announcements(results, target_name, servo, servo.current_angle, announce_state)
 
-                servo.publish_recognition(
-                    name=result.name,
-                    distance=result.distance,
-                    similarity=result.similarity,
-                    angle=angle,
-                    attempt=attempt
-                )
+        if angle == end_angle:
+            break
 
-                return result.name, False
+        angle += direction * SCAN_STEP_ANGLE
+        if (direction > 0 and angle > end_angle) or (direction < 0 and angle < end_angle):
+            angle = end_angle
 
-            # ----------------------------------------------
-            # UNKNOWN FACE -> STRANGER
-            # ----------------------------------------------
-            else:
-                if not stranger_announced:
-                    print(
-                        f"[SCAN {attempt}] Stranger detected at {angle} degrees "
-                        f"(dist={result.distance:.3f})"
-                    )
+        servo.move_to(angle)
+        time.sleep(SCAN_STEP_SETTLE_TIME)
 
-                    servo.publish_recognition(
-                        name="Stranger",
-                        distance=result.distance,
-                        similarity=result.similarity,
-                        angle=angle,
-                        attempt=attempt
-                    )
+    return "not_found_reached_end", False
 
-                    stranger_announced = True
 
-                time.sleep(FRAME_CHECK_INTERVAL)
+# ============================================================
+# LOCK-ON: WATCH + LIVE TRACKING
+# ============================================================
 
-        print(
-            f"[SCAN {attempt}] No known match at {angle} degrees "
-            f"after {POSITION_HOLD_TIME:.0f}s, moving on"
-        )
+def chase_after_loss(cap, detector, embedder, matcher, servo, target_name, direction_sign) -> str:
+    """
+    The target just left frame. Rather than immediately giving up, keep
+    pushing the servo further in `direction_sign` -- the actual physical
+    direction the servo was already moving during the last successful
+    tracking nudge, not a recomputed sign -- in short steps, checking the
+    camera at each one, for up to CHASE_MAX_DEGREES. This is a guess at
+    where they walked to, based on which way the servo was already
+    heading right before they disappeared.
 
-    # all positions exhausted, nobody found this sweep
-    servo.publish_not_found()
+    Returns "found" (re-acquired -- caller should resume watch_and_track),
+    "not_found" (chase exhausted, genuinely lost), or "quit".
+    """
+    traveled = 0
+    start_angle = servo.current_angle
+
+    print(f"[CHASE] {target_name} left frame near {start_angle} degrees -- "
+          f"chasing toward where they were heading")
+
+    while traveled < CHASE_MAX_DEGREES:
+        prev_angle = servo.current_angle
+        next_angle = prev_angle + direction_sign * CHASE_STEP_ANGLE
+        clamped = max(0, min(180, next_angle))
+
+        servo.move_to(clamped)
+        traveled += abs(clamped - prev_angle)
+        time.sleep(CHASE_STEP_SETTLE_TIME)
+
+        ok, frame = cap.read()
+        if not ok:
+            continue
+
+        results = analyze_frame(frame, detector, embedder, matcher)
+        target = find_target(results, target_name)
+
+        vis = render_frame(frame, results, target_name, target_present=target is not None,
+                            extra_text=f"CHASING {target_name}...  ({servo.current_angle}\u00b0)")
+        cv2.imshow("Falcon Eye", vis)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            return "quit"
+
+        if target is not None:
+            face, result = target
+            print(f"[CHASE] Re-acquired {target_name} at {servo.current_angle} degrees")
+            return "found"
+
+        # Hit the physical end of travel -- no point continuing this way.
+        if clamped in (0, 180):
+            break
+
+    print(f"[CHASE] Didn't find {target_name} within {CHASE_MAX_DEGREES} degrees of last sighting")
+    return "not_found"
+
+
+def watch_and_track(cap, detector, embedder, matcher, servo, target_name) -> bool:
+    """
+    Actively track target_name while visible, nudging the servo to follow
+    their left/right movement in real time. When they leave frame, first
+    chases a short distance further in the direction they were last
+    drifting (the edge of frame they exited from) to try to reacquire
+    them. Only if that chase comes up empty do we give up, log "Lost",
+    and let the caller resume the normal sweep from wherever the servo
+    now sits. Returns quit_requested.
+    """
+    missed = 0
+    last_nudge_direction = 0  # actual physical sign of the last servo move, for chasing
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            time.sleep(FRAME_CHECK_INTERVAL)
+            continue
+
+        frame_w = frame.shape[1]
+        results = analyze_frame(frame, detector, embedder, matcher)
+        target = find_target(results, target_name)
+
+        vis = render_frame(frame, results, target_name, target_present=target is not None)
+        cv2.imshow("Falcon Eye", vis)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            return True
+
+        nudged = False
+
+        if target is not None:
+            face, result = target
+            missed = 0
+
+            offset = face_offset_normalized(face, frame_w)
+            if abs(offset) > TRACK_DEADZONE:
+                step = float(np.clip(offset * TRACK_GAIN, -TRACK_MAX_STEP, TRACK_MAX_STEP))
+                prev_angle = servo.current_angle
+                servo.nudge(SERVO_DIRECTION_SIGN * step)
+                nudged = True
+                # Record the servo's ACTUAL resulting direction, not a
+                # recomputed sign -- this is what chase_after_loss will
+                # continue, so it can never disagree with reality (clamping
+                # at 0/180, rounding, etc. all wash out automatically).
+                if servo.current_angle != prev_angle:
+                    last_nudge_direction = 1 if servo.current_angle > prev_angle else -1
+
+        else:
+            missed += 1
+            if missed >= MISSED_CHECKS_BEFORE_LOST:
+                if last_nudge_direction != 0:
+                    outcome = chase_after_loss(cap, detector, embedder, matcher, servo,
+                                                target_name, last_nudge_direction)
+                    if outcome == "quit":
+                        return True
+                    if outcome == "found":
+                        missed = 0
+                        continue  # back into normal tracking above
+
+                print(f"[WATCH] Lost {target_name} -- resuming sweep in the same direction "
+                      f"from {servo.current_angle} degrees")
+                return False
+
+        # If we just moved the servo, give it extra time to physically get
+        # there before the next frame is grabbed -- otherwise the next
+        # frame can be captured mid-turn (blur / momentarily out of frame),
+        # which reads as a false "missed" detection and can spuriously
+        # trip MISSED_CHECKS_BEFORE_LOST even though you never moved.
+        time.sleep(TRACK_SETTLE_TIME if nudged else FRAME_CHECK_INTERVAL)
+
+
+# ============================================================
+# FULL-RANGE SEARCH (both legs -> confirm absence if neither finds them)
+# ============================================================
+
+def run_absence_confirming_search(cap, detector, embedder, matcher, servo, target_name) -> bool:
+    """
+    Sweeps the whole 0-180 range in two legs (current -> 0, then 0 -> 180),
+    locking onto and following the target whenever seen. After they
+    disappear, resumes the SAME leg in the SAME direction from wherever the
+    servo currently is, rather than restarting. Only once both legs are
+    covered with no sighting is absence confirmed (published over MQTT).
+    Returns quit_requested.
+    """
 
     print()
     print("=" * 60)
-    print("NOT FOUND (this sweep) -- restarting scan")
-    print(f"Completed {NUMBER_OF_SCANS} scan positions")
+    print(f"STARTING FULL-RANGE SEARCH for {target_name or '(no target selected)'}")
     print("=" * 60)
 
-    return None, False
+    announce_state = {"stranger_active": False, "known_active": set()}
+    legs = [0, 180]
+
+    for leg_end in legs:
+        while True:
+            outcome, quit_requested = continuous_sweep_phase(
+                cap, detector, embedder, matcher, servo, target_name,
+                servo.current_angle, leg_end, announce_state
+            )
+
+            if quit_requested:
+                return True
+
+            if outcome == "not_found_reached_end":
+                print(f"[SWEEP] Reached {leg_end} degrees -- not there in this direction")
+                break
+
+            # outcome == "found" -> lock on and watch until they leave
+            quit_requested = watch_and_track(cap, detector, embedder, matcher, servo, target_name)
+            if quit_requested:
+                return True
+
+            print(f"[SWEEP] Resuming search toward {leg_end} degrees")
+            # loop back: continuous_sweep_phase resumes from servo.current_angle -> leg_end
+
+    servo.publish_not_found()
+    print()
+    print("=" * 60)
+    print("ABSENCE CONFIRMED -- not found across the full range, restarting from home")
+    print("=" * 60)
+
+    return False
+
+
+# ============================================================
+# TARGET SELECTION
+# ============================================================
+
+def select_target(matcher: FaceDBMatcher) -> Optional[str]:
+    if not matcher._names:
+        print("[WARNING] Face database is empty -- nobody to follow.")
+        return None
+
+    if TARGET_NAME:
+        if TARGET_NAME in matcher._names:
+            return TARGET_NAME
+        print(f"[WARN] TARGET_NAME '{TARGET_NAME}' not found in database.")
+
+    print("\nKnown identities in database:")
+    for i, name in enumerate(matcher._names, start=1):
+        print(f"  {i}. {name}")
+
+    while True:
+        choice = input("Who should Falcon Eye follow? (number or name): ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(matcher._names):
+            return matcher._names[int(choice) - 1]
+        if choice in matcher._names:
+            return choice
+        print("Invalid choice, try again.")
 
 
 # ============================================================
@@ -481,46 +834,33 @@ def main():
 
     print()
     print("=" * 60)
-    print("FALCON EYE FACE RECOGNITION (automatic mode)")
+    print("FALCON EYE FACE RECOGNITION (full-range sweep, direction-following)")
     print("=" * 60)
 
-    # --------------------------------------------------------
-    # FACE DETECTOR
-    # --------------------------------------------------------
     detector = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=False)
 
-    # --------------------------------------------------------
-    # ARC FACE
-    # --------------------------------------------------------
     embedder = ArcFaceEmbedderONNX(model_path=ARC_FACE_MODEL, input_size=(112, 112))
 
-    # --------------------------------------------------------
-    # DATABASE
-    # --------------------------------------------------------
     db = load_db_npz(DB_PATH)
     matcher = FaceDBMatcher(db=db, dist_thresh=DISTANCE_THRESHOLD)
 
     print("[DB] Identities:", len(matcher._names))
-
     if matcher._names:
         print("[DB] Names:", ", ".join(matcher._names))
     else:
         print("[WARNING] Face database is empty!")
 
-    # --------------------------------------------------------
-    # MQTT / SERVO
-    # --------------------------------------------------------
-    servo = ServoController()
+    target_name = select_target(matcher)
+    if target_name:
+        print(f"[TARGET] Falcon Eye will follow: {target_name}")
+    else:
+        print("[TARGET] No target -- will only report strangers/known faces, never lock on.")
 
-    # Start centered
+    servo = ServoController()
     servo.move_to(HOME_ANGLE)
     time.sleep(0.5)
 
-    # --------------------------------------------------------
-    # CAMERA
-    # --------------------------------------------------------
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-
     if not cap.isOpened():
         servo.close()
         raise RuntimeError("Camera not available")
@@ -529,62 +869,19 @@ def main():
     print("Camera ready")
     print("MQTT ready")
     print()
-    print("Scanning starts automatically. Press 'q' in the video window to quit.")
+    print("Full-range search starts automatically. Press 'q' in the video window to quit.")
 
-    # --------------------------------------------------------
-    # AUTOMATIC LOOP: keep sweeping until found, then keep
-    # watching that spot; if they leave, sweeping resumes.
-    # --------------------------------------------------------
     try:
         while True:
-
-            found_name, quit_requested = run_one_sweep(cap, detector, embedder, matcher, servo)
+            quit_requested = run_absence_confirming_search(cap, detector, embedder, matcher, servo, target_name)
 
             if quit_requested:
                 break
 
-            if found_name:
-                print(f"RESULT: {found_name} -- holding position and watching")
-
-                # Stay here and keep confirming the known face is still present.
-                # If they leave (face not seen for a while), resume scanning.
-                missed_checks = 0
-                MAX_MISSED_CHECKS = 6  # ~3s of no detection before resuming scan
-
-                while True:
-                    ok, frame = cap.read()
-                    if not ok:
-                        time.sleep(FRAME_CHECK_INTERVAL)
-                        continue
-
-                    result, faces = recognize_frame(frame, detector, embedder, matcher)
-
-                    vis = draw_faces(frame, faces)
-                    cv2.putText(vis, f"Watching: {found_name}", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.imshow("Falcon Eye", vis)
-
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord("q"):
-                        quit_requested = True
-                        break
-
-                    if result is not None and result.accepted and result.name == found_name:
-                        missed_checks = 0
-                    else:
-                        missed_checks += 1
-
-                    if missed_checks >= MAX_MISSED_CHECKS:
-                        print(f"[WATCH] {found_name} no longer detected -- resuming scan")
-                        break
-
-                    time.sleep(FRAME_CHECK_INTERVAL)
-
-                if quit_requested:
-                    break
-
-            # loop back and sweep again automatically (whether NOT_FOUND
-            # or the watched person left)
+            # absence confirmed across the full range -- return home and
+            # start the whole sweep again automatically
+            servo.move_to(HOME_ANGLE)
+            time.sleep(SERVO_SETTLE_TIME)
 
     finally:
         cap.release()

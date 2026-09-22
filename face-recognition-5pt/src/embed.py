@@ -107,7 +107,7 @@ def cosine_similarity(a, b):
 
 
 def main():
-    cap = cv2.VideoCapture(2)
+    cap = cv2.VideoCapture(0)
     det = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=False)
     emb_model = ArcFaceEmbedderONNX(model_path="models/embedder_arcface.onnx", debug=False)
 
