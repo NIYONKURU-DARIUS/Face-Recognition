@@ -868,6 +868,7 @@ def main():
     print()
     print("Camera ready")
     print("MQTT ready")
+    cv2.namedWindow("Falcon Eye", cv2.WINDOW_NORMAL)
     print()
     print("Full-range search starts automatically. Press 'q' in the video window to quit.")
 

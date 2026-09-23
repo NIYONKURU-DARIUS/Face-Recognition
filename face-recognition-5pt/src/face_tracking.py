@@ -261,6 +261,9 @@ def main():
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
 
+    if not args.signal:
+        cv2.namedWindow("Locked Face Tracking", cv2.WINDOW_NORMAL)
+
     blink_total = 0
     signal_miss_count = 0
     last_face_state = None

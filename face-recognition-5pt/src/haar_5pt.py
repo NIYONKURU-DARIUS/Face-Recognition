@@ -306,6 +306,7 @@ def main():
     det = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=True, max_faces=8)
 
     print("Haar + 5pt (FaceLandmarker) test -- now multi-face. Press q to quit.")
+    cv2.namedWindow("haar_5pt", cv2.WINDOW_NORMAL)
 
     while True:
         ok, frame = cap.read()
